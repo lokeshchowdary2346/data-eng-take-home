@@ -10,8 +10,7 @@ user purchases (Python) and a SQL design for tracking user risk scores over time
 | `tests/` | pytest suites for both problems. |
 | `data/user_risk_data.csv` | Sample data supplied with the problem. |
 
-The design reasoning, assumptions and edge cases are written up in the docstring at the top of
-`01.py` and the comment block at the top of `02.sql`, so each file stands on its own.
+Design notes and assumptions are in the header of each file.
 
 ## Problem 01: user sales store
 

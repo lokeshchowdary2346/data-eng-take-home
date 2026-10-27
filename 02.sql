@@ -1,76 +1,48 @@
--- =====================================================================================
--- Problem 02: User Risk Score Calendar
--- Dialect: Redshift-compatible SQL (also runs unchanged on PostgreSQL 14+).
---          Tested on PostgreSQL 16. Redshift-only physical options are shown in the
---          commented block just below (DISTKEY/SORTKEY cannot be run on plain Postgres).
--- =====================================================================================
+-- Problem 02: user risk score calendar
+-- Dialect: Redshift-compatible SQL, also runs on PostgreSQL 14+ (tested on 16).
 --
--- DESIGN IN ONE PARAGRAPH
---   Two small tables built from user_risk_scores:
---     1) risk_score_intervals      one row per (user, score CHANGE): the score holds from
---                                  valid_from through valid_to (both inclusive dates).
---                                  Source of truth for point lookups.
---     2) risk_score_daily_summary  one row per calendar day: active_users and the average
---                                  score across them. Answers the analyst question directly.
---   Neither table has a row per (user, day).
+-- Design
+--   risk_score_intervals      one row per score change per user: the score holds from
+--                             valid_from to valid_to (inclusive dates). Used for point lookups.
+--   risk_score_daily_summary  one row per day: active_users and the average score.
+--                             Used for the population average.
 --
--- SEMANTICS (assumptions I am making explicit)
---   * "Score on date D" = the last score recorded at or before the end of day D, carried
---     forward until the user's next event (a score is a state, not a one-day event).
---   * A user has no score before the date of their first event. Point lookup returns zero
---     rows there, and the user is NOT in that day's population average.
---   * Dates are UTC calendar dates, CAST(created_ts AS DATE). If the business day is in
---     another time zone, convert created_ts before the cast.
---   * Several events on one day: the latest created_ts wins. If two rows share the exact
---     same created_ts for one user, the higher risk_score wins (arbitrary but deterministic,
---     so rebuilds give identical results).
---   * Lookups beyond CURRENT_DATE return nothing (the requirement is first event through
---     the current date). The last interval of a user is open-ended: valid_to = 9999-12-31.
---     That means no nightly writes are needed to "extend" scores through today.
---   * If the score does not change from one event to the next (the sample has users
---     1028 to 1033 repeating a score) the days are merged into one interval.
+-- Assumptions
+--   * The score on date D is the last score recorded on or before D, carried forward until
+--     the user's next event.
+--   * No score before a user's first event: the lookup returns no rows and the user is not
+--     in that day's average.
+--   * Dates are UTC (CAST(created_ts AS DATE)).
+--   * Several events on one day: the latest created_ts wins. An exact timestamp tie takes the
+--     higher score, just so rebuilds are deterministic.
+--   * Lookups after CURRENT_DATE return nothing. Each user's last interval is open-ended
+--     (valid_to = 9999-12-31), so nothing needs writing each day.
+--   * Consecutive days with the same score are merged into one interval.
 --
--- WHY INTERVALS + A DAILY SUMMARY (and not the alternatives)
---   A) Dense user x day table. Simplest to query, but storage is users x days. 5M users
---      over 2 years is about 3.6 billion rows, and every day appends one row per user even
---      if nothing changed. Rejected: cost grows with time, not with information.
---   B) Raw events only (no new table). Free to build, but both queries need
---      "latest row at or before D" per user, which is a window or lateral join over a huge
---      table. The population average re-does that for every user on every analyst query.
---   C) Intervals only. Compact and good for point lookups; but the population average must
---      scan every interval overlapping D (it is O(intervals) per query).
---   D) Intervals + daily summary (chosen). Storage is O(score changes + days). Point
---      lookup is a prefix-sorted range probe on one user. The analyst query reads one row
---      from a table with one row per day. The only cost is a rebuild step, shown below.
+-- Why this shape
+--   A dense user x day table grows with time even when nothing changes (5M users over 2 years
+--   is roughly 3.6B rows). Querying the raw events means finding "latest row at or before D"
+--   per user on every query. Intervals alone make the population average scan every interval
+--   that overlaps the date. Intervals plus a small daily summary keeps storage at
+--   O(score changes + days) and makes both lookups cheap.
 --
--- PERFORMANCE AT MILLIONS OF ROWS (N = events, U = users, T = days)
---   Storage   intervals <= N rows (usually far fewer after merging equal scores and
---             same-day events). summary = T rows (a few hundred to a few thousand).
---   Build     intervals: one partitioned sort of N rows. Both window functions share the
---             partition key user_id, so with DISTKEY(user_id) there is no redistribution.
---             summary: one pass over the intervals using a running sum of +score at
---             valid_from and -score at the day after valid_to. It avoids a calendar x
---             intervals range join (O(T x intervals)). Cost is O(intervals + T).
---             Incrementally, only users with new events change; the summary is append-only
---             unless data arrives late (late data touches the days from its date forward,
---             so rebuild from the earliest affected date).
---   Point     user_id is the leading sort key: zone maps prune to a few blocks, then the
---             user's own intervals (a handful of rows) are filtered by date. Effectively
---             O(log) block probe + O(intervals per user).
---   Average   a single-row read from risk_score_daily_summary by score_date.
+-- Cost at millions of rows (N events, T days)
+--   Storage  intervals <= N rows, summary = T rows.
+--   Build    one partitioned sort of N rows for the intervals. The summary is a single pass
+--            using a running sum of +score at valid_from and -score the day after valid_to,
+--            which avoids a calendar x intervals range join.
+--   Point    sorted on (user_id, valid_from), so it touches one user's few rows.
+--   Average  reads one row by score_date.
+--   Late-arriving data changes every day from its date onward, so rebuild the summary from
+--   the earliest affected date.
 --
--- EDGE CASES HANDLED
---   user with 1 event; several events in one day; consecutive equal scores; score gap of
---   months (user 1053: Jan to Oct); date before first event; date after today; users that
---   start on different days (the population average denominator changes, active_users is
---   stored next to the average so analysts can see it); idempotent rebuild (DROP + CREATE).
---   NOT handled / known limits: the calendar generator below covers 10,000 days (about
---   27 years) from the earliest event (raise it by adding one more digits join); scores are
---   cast to DECIMAL(38,10) for the running sum so repeated add/subtract does not drift, which
---   assumes at most 10 decimal places of precision in risk_score.
+-- Limits
+--   The calendar generator covers 10,000 days from the first event. Scores are cast to
+--   DECIMAL(38,10) for the running sum so repeated add/subtract doesn't drift, which assumes
+--   at most 10 decimal places.
 --
--- REDSHIFT PHYSICAL DESIGN (apply by creating the table first, then INSERT ... SELECT with
--- the same query body; plain Postgres ignores/does not support these options)
+-- Redshift physical design (run these as the CREATE TABLEs, then INSERT ... SELECT with the
+-- same query bodies; plain Postgres doesn't support DISTKEY/SORTKEY)
 --   CREATE TABLE risk_score_intervals (
 --       user_id    INTEGER          NOT NULL,
 --       valid_from DATE             NOT NULL,
@@ -83,10 +55,8 @@
 --       avg_risk_score DOUBLE PRECISION
 --   ) DISTSTYLE ALL SORTKEY (score_date);
 --
--- NOTE ON DATE ARITHMETIC: "DATE - 1" and "DATE + 1" return a DATE in both Redshift and
--- PostgreSQL. Recursive CTEs are avoided on purpose: Redshift caps them at
--- max_recursion_rows (default 100), which is too small for a daily calendar.
--- =====================================================================================
+-- Note: "DATE + 1" and "DATE - 1" work in both Redshift and Postgres. I avoided recursive
+-- CTEs because Redshift limits them to max_recursion_rows (default 100).
 
 
 -- -------------------------------------------------------------------------------------

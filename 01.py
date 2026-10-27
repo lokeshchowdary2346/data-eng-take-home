@@ -1,95 +1,46 @@
 """
-Problem 01: User Sales Data Structure
-=====================================
+Problem 01: user sales data structure.
 
-Run it:  python 01.py        (standard library only, Python 3.10+)
+Run with `python 01.py` (standard library only, Python 3.10+).
 
-WHAT I BUILT
-------------
-`SalesStore`, an append-only in-memory store with ONE source of truth (the
-transactions) and a few indexes that are maintained on every write:
+Design
+------
+The main access path is "all purchases for a user_id", so transactions live in a dict
+keyed by user_id (a list per user, in purchase order). Two extra indexes are kept up to date
+on every write:
 
-    _users        : dict[user_id -> User]                  user dimension
-    _by_user      : dict[user_id -> list[Transaction]]     PRIMARY ACCESS PATH
-    _ltv_cents    : dict[user_id -> int]                   running lifetime value
-    _by_product   : dict[product_id -> list[Transaction]]  secondary index
-    _buyers       : dict[product_id -> set[user_id]]       distinct buyers
+    _by_user     user_id    -> list of transactions     (primary)
+    _ltv_cents   user_id    -> running total in cents
+    _by_product  product_id -> list of transactions     (same objects, no copies)
+    _buyers      product_id -> set of user_ids          (distinct buyers)
 
-    Operation                               Cost
-    ------------------------------------    ---------------------------------
-    all transactions for a user_id          O(1) + O(k) to copy k rows
-    lifetime value of a user                O(1)  (running total)
-    all users who bought a product          O(1) + O(b) to copy b buyers
-    revenue / purchase count per product    O(p) over that product's rows
-    add one purchase                        O(1) amortised
+Lookups are O(1) plus the cost of copying the result. Adding a purchase is O(1).
 
-WHY THESE CHOICES
------------------
-* The workload is "all of a user's purchases, keyed on user_id", so a hash map
-  from user_id to that user's transaction list is the primary structure.
-  The list is chronological (append order), so "latest purchase", "first
-  purchase", "last N" are cheap slices.
-* "Who bought product X" is the inverse access pattern. A scan would be
-  O(all transactions), so I keep a product -> buyers index. It is a set of
-  user_ids because one user can buy the same product twice and the question
-  is about distinct users. The per-product transaction list shares the same
-  Transaction objects (references, not copies), so it costs only pointers
-  and answers revenue-per-product, units-per-product, top buyers, etc.
-* Money is stored as integer cents, never float. 0.1 + 0.2 != 0.3 is not an
-  acceptable property for a ledger. `Decimal` is used only at the edges
-  (parsing "$5.66" and presenting totals).
-* Lifetime value is a running total updated on write. That is safe because the
-  store is append-only. Refunds/chargebacks are modelled as NEGATIVE-cost
-  transactions rather than edits, so the total stays correct and the history
-  stays auditable. `recompute_lifetime_value_cents` exists as a cross-check.
-* Transactions are frozen dataclasses with __slots__: immutable (indexes can
-  safely share them) and compact in memory.
-* The user_id is the join key everywhere. `username` is NOT unique in the
-  sample data ("andrew" is both 654282 and 908762), so results that identify
-  people return user_ids, with usernames attached only as a display helper.
+Decisions
+---------
+- Money is stored as integer cents so totals are exact. Strings like "$5.66" are parsed on
+  the way in, and values with more than 2 decimal places are rejected.
+- Lifetime value is a running total. That works because the store is append-only; a refund
+  would be a negative transaction rather than an edit.
+- username isn't unique in the sample (two "andrew"s), so everything is keyed by user_id.
+- The sample purchases have no id, so a transaction_id is generated. I also allow an
+  optional purchased_at, since time-based questions are the obvious next ask.
 
-FIELDS I ADDED
---------------
-`transaction_id` (the sample purchases have no key, so one is generated; a
-caller-supplied id is rejected if it is a duplicate, which makes replays of a
-load idempotent) and an optional `purchased_at` timestamp. Real purchase data
-will need time, and "LTV in the last 90 days" is an obvious next question.
-Quantity/currency/order_id would be added the same way (new optional field on
-Transaction, nothing else changes).
+Sample data issues
+------------------
+- User 123456 has a purchase but no user row. I keep the purchase and expose it through
+  orphan_user_ids() instead of dropping money data.
+- Users 654282 and 908762 have no purchases (empty list, lifetime value 0).
 
-DATA ISSUES FOUND IN THE SAMPLE (and what the code does)
---------------------------------------------------------
-1. Purchase for user_id 123456 has no matching user. Dropping money records is
-   worse than keeping them, so the transaction is stored and flagged:
-   `orphan_user_ids()` lists such users, and `has_user()` returns False.
-2. Users 654282 and 908762 have no purchases. Lookup returns an empty list and
-   lifetime value is 0.00. (An unknown user_id behaves the same way; use
-   `has_user()` to tell "no purchases" from "no such user".)
-3. Costs arrive as strings: "$5.66" and "$100.0". `parse_money_to_cents`
-   handles "$", commas and whitespace, and REJECTS sub-cent values like
-   "$1.005" instead of silently rounding money.
-4. Duplicate usernames, see above.
-5. Product 2 appears for two different users, which the buyers index handles.
-
-SERIALIZATION
+Serialization
 -------------
-Only the base records are serialized (users + transactions). Indexes are
-derived data and are rebuilt on load. That means:
-  * no way for a stored index to disagree with the stored transactions,
-  * smaller payloads, and
-  * adding a new index later needs no data migration.
-Format is JSON with a `schema_version`, money as integer cents, timestamps as
-ISO-8601 strings. JSON is fine at this scale and is human-inspectable. For
-millions of rows I would write the same two flat tables as Parquet (columnar,
-dictionary-encoded user_id/product_id) and rebuild indexes at load, or keep
-them in a real store. `to_json` / `from_json` below do the round trip and the
-demo asserts that it is lossless.
+Only users and transactions are written out (JSON, money as cents). The indexes are derived,
+so they're rebuilt on load. That keeps them from ever disagreeing with the stored data and
+means a new index needs no migration. At larger scale I'd write the same two tables as Parquet.
 
-KNOWN LIMITS
-------------
-Not thread-safe (wrap writes in a lock or use a single writer). Everything is in
-RAM, so memory grows with transactions. Indexes cost roughly one extra pointer
-per transaction per index.
+Limits
+------
+Not thread-safe, and everything is held in memory.
 """
 
 from __future__ import annotations
