@@ -1,64 +1,29 @@
 # Data engineering take-home
 
-Solutions to a two-part data engineering take-home: an in-memory data structure for
-user purchases (Python) and a SQL design for tracking user risk scores over time.
+Two problems from a data engineering take-home.
 
-| File | What it is |
-| --- | --- |
-| `01.py` | Problem 01, in-memory user sales store. Standard library only. |
-| `02.sql` | Problem 02, risk score calendar. Postgres / Redshift-compatible SQL. |
-| `tests/` | pytest suites for both problems. |
-| `data/user_risk_data.csv` | Sample data supplied with the problem. |
+- `01.py`: in-memory store for user purchases. Run it with `python 01.py`.
+- `02.sql`: SQL for tracking each user's risk score over time. Written for Redshift, also runs on Postgres.
+- `data/user_risk_data.csv`: sample data for problem 02.
+- `tests/test_01.py`: tests for problem 01 (`pip install pytest`, then `pytest`).
 
-Design notes and assumptions are in the header of each file.
+## Problem 01
 
-## Problem 01: user sales store
+Purchases are stored in a dict keyed by `user_id`, with a second dict from product to the set of
+users who bought it, so both lookups are a single dict access. Money is kept in cents. Notes on the
+design and on the oddities in the sample data (a purchase with no matching user, duplicate usernames)
+are at the top of `01.py`.
 
-`SalesStore` keeps transactions in a dict keyed by `user_id` (the access path the problem calls out),
-plus a product-to-buyers index so "who bought product X" doesn't need a scan. Money is held as integer
-cents. Lifetime value is a running total, which is safe because the store is append-only (refunds are
-negative transactions).
+## Problem 02
 
-```bash
-python3 01.py
+Two tables: one row per score change per user (`risk_score_intervals`), and one row per day with the
+average score (`risk_score_daily_summary`). That avoids a user x day table that keeps growing even
+when nothing changes. Assumptions and the cost at larger sizes are in the header of `02.sql`.
+
+To try it, load the CSV into a table called `user_risk_scores` and run `02.sql`:
+
+```sql
+CREATE TABLE user_risk_scores (user_id INT, created_ts TIMESTAMP, risk_score DOUBLE PRECISION);
+\copy user_risk_scores FROM 'data/user_risk_data.csv' CSV HEADER
+\i 02.sql
 ```
-
-Things the sample data forced me to decide:
-
-- Purchases for a `user_id` with no user record (123456) are kept and flagged, not dropped.
-- `username` isn't unique (two "andrew"s), so results are keyed by `user_id`.
-- Costs come in as strings like `"$100.0"`; they are parsed to cents, and sub-cent values are rejected.
-
-## Problem 02: risk score calendar
-
-Two tables built from `user_risk_scores`:
-
-- `risk_score_intervals`: one row per score *change* per user, as a closed date range. Used for the
-  point lookup.
-- `risk_score_daily_summary`: one row per day with the active user count and average score. Used for the
-  population average.
-
-A dense user x day table would grow with time even when nothing changes, so I avoided it. The comment
-block in `02.sql` compares the alternatives and covers cost at millions of rows.
-
-Assumptions worth knowing: a score is carried forward until the user's next event; the latest event of a
-day wins; dates are UTC; a user is not in the population average before their first event.
-
-## Running the tests
-
-```bash
-pip install -r requirements-dev.txt
-make test        # everything
-make test-01     # Problem 01 only, no database needed
-```
-
-`02.sql` is tested against PostgreSQL 16 (closest free stand-in for Redshift), driven through the `psql`
-CLI. `scripts/run_tests.sh` uses whichever of these it finds first: a server you point at with
-`PGHOST`/`PGPORT`/`PGUSER`, Docker (`docker-compose.yml`), or locally installed Postgres binaries.
-
-The expected results are computed independently in pandas (`tests/oracle.py`) rather than by re-using the
-SQL logic, so the tests can actually catch mistakes in it.
-
-## Submission
-
-`make package` zips `01.py` and `02.sql`.

@@ -165,10 +165,3 @@ WHERE user_id = 1002
 SELECT score_date, active_users, avg_risk_score
 FROM risk_score_daily_summary
 WHERE score_date = DATE '2025-03-05';
-
--- Need 2, fallback: the same answer computed straight from the intervals table, without the
--- summary table. Useful to cross-check the summary, or if the summary is not built yet.
-SELECT AVG(risk_score) AS avg_risk_score, COUNT(*) AS active_users
-FROM risk_score_intervals
-WHERE DATE '2025-03-05' BETWEEN valid_from AND valid_to
-  AND DATE '2025-03-05' <= CURRENT_DATE;
